@@ -1,0 +1,25 @@
+# Data — never commit competition data (licensed)
+data/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+.venv/
+env/
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Models and experiment artifacts
+*.pkl
+*.joblib
+*.pt
+*.ckpt
+mlruns/
+wandb/
+
+# OS
+.DS_Store
+Thumbs.db
