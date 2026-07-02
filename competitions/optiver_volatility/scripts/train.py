@@ -3,7 +3,7 @@ competitions/optiver_volatility/scripts/train.py
 -------------------------------------------------
 LightGBM training for Optiver Realized Volatility Prediction.
 Metric: RMSPE (Root Mean Squared Percentage Error)
-CV: Purged walk-forward splits on time_id
+CV: GroupKFold on time_id (prevents temporal leakage)
 """
 
 import numpy as np
@@ -11,6 +11,9 @@ import pandas as pd
 import lightgbm as lgb
 import sys
 from pathlib import Path
+from scipy.spatial.distance import pdist
+from scipy.cluster.hierarchy import linkage, leaves_list, optimal_leaf_ordering
+from sklearn.model_selection import GroupKFold
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 from core.eval import rmspe
@@ -27,12 +30,15 @@ FEATURE_COLS = [
     "wap1_drift", "book_update_count", "rv_accel",
     "trade_size_sum", "trade_size_mean", "trade_size_std",
     "trade_count", "trade_price_std", "log_trade_volume",
+    "target_lag1", "target_lag2"  # Added our true chronological lags
 ]
 
 # Custom RMSPE objective for LightGBM
 def rmspe_objective(y_pred, dataset):
     y_true = dataset.get_label()
+    # grad: 1st derivative of RMSPE squared error
     grad = -2 * (y_true - y_pred) / (y_true ** 2)
+    # hess: 2nd derivative
     hess = 2 / (y_true ** 2)
     return grad, hess
 
@@ -54,25 +60,29 @@ def load_data():
 
     train = pd.read_csv(DATA_DIR / "train.csv")
     df = feats.merge(train, on=["stock_id", "time_id"], how="inner")
+    
+    print("  Reconstructing chronological timeline...")
+    pivot_df = df.pivot(index='time_id', columns='stock_id', values='target')
+    pivot_df = pivot_df.apply(lambda col: col.fillna(col.mean()), axis=0)
+
+    distances = pdist(pivot_df.values, metric='correlation')
+    Z = linkage(distances, method='ward')
+    Z_opt = optimal_leaf_ordering(Z, distances)
+    ordered_indices = leaves_list(Z_opt)
+
+    ordered_time_ids = pivot_df.index[ordered_indices]
+    time_map = {tid: rank for rank, tid in enumerate(ordered_time_ids)}
+
+    df['chrono_rank'] = df['time_id'].map(time_map)
+    df = df.sort_values(['stock_id', 'chrono_rank']).reset_index(drop=True)
+
+    print("  Generating true chronological lags...")
+    df['target_lag1'] = df.groupby('stock_id')['target'].shift(1)
+    df['target_lag2'] = df.groupby('stock_id')['target'].shift(2)
+
+    df = df.dropna(subset=['target_lag1', 'target_lag2']).reset_index(drop=True)
+
     return df
-
-
-def walk_forward_cv(df, n_splits=5):
-    """
-    Walk-forward CV on time_id. Earlier time_ids train, later ones validate.
-    time_id is not a true timestamp but is ordered — higher = later.
-    """
-    time_ids = sorted(df["time_id"].unique())
-    fold_size = len(time_ids) // (n_splits + 1)
-
-    splits = []
-    for i in range(1, n_splits + 1):
-        train_ids = set(time_ids[: i * fold_size])
-        val_ids   = set(time_ids[i * fold_size : (i + 1) * fold_size])
-        train_idx = df[df["time_id"].isin(train_ids)].index
-        val_idx   = df[df["time_id"].isin(val_ids)].index
-        splits.append((train_idx, val_idx))
-    return splits
 
 
 def train(use_log_target=False):
@@ -82,14 +92,18 @@ def train(use_log_target=False):
 
     X = df[FEATURE_COLS]
     y = df["target"]
+    groups = df["time_id"]
+    
     if use_log_target:
         y_train_raw = np.log(y)
         print("  Using log(target)")
     else:
         y_train_raw = y
-        print("  Using raw target")
+        print("  Using raw target with Custom RMSPE Objective")
 
-    splits = walk_forward_cv(df, n_splits=5)
+    # Swapped to GroupKFold to prevent leakage across time_ids
+    gkf = GroupKFold(n_splits=5)
+    splits = list(gkf.split(X, y_train_raw, groups=groups))
     print(f"  CV splits: {len(splits)}")
 
     lgb_params = {
@@ -107,35 +121,51 @@ def train(use_log_target=False):
 
     cv_scores = []
     models = []
+    oof_preds_lgb = np.zeros(len(df))
 
     for fold, (train_idx, val_idx) in enumerate(splits):
         X_tr, y_tr = X.loc[train_idx], y_train_raw.loc[train_idx]
         X_val, y_val = X.loc[val_idx], y.loc[val_idx]  # always eval on raw target
 
         if use_log_target:
-            model = lgb.LGBMRegressor(**lgb_params)
+            # We use standard regression for log target
+            model = lgb.LGBMRegressor(**lgb_params, objective="regression")
             model.fit(
                 X_tr, y_tr,
                 eval_set=[(X_val, np.log(y_val))],
-                callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(100)],
+                callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(0)],
             )
             val_preds = np.exp(model.predict(X_val))
         else:
+            # We use the Dataset API to pass the custom objective natively
             dtrain = lgb.Dataset(X_tr, label=y_tr)
-            dval   = lgb.Dataset(X_val, label=y_val)
+            dval   = lgb.Dataset(X_val, label=y_val, reference=dtrain)
+            
+            params_copy = lgb_params.copy()
+            iters = params_copy.pop("n_estimators")
+            
+            # --- FIX: Assign the function directly to the objective key ---
+            params_copy["objective"] = rmspe_objective
+            
             model = lgb.train(
-                {**lgb_params, "objective": "regression"},
+                params_copy, 
                 dtrain,
+                num_boost_round=iters,
                 valid_sets=[dval],
-                feval=rmspe_metric,
-                callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(100)],
+                feval=rmspe_metric,   # feval is still a valid argument for lgb.train()
+                callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(0)],
             )
             val_preds = model.predict(X_val)
+            oof_preds_lgb[val_idx] = val_preds
 
         score = rmspe(y_val.values, val_preds)
         cv_scores.append(score)
         models.append(model)
-        print(f"  Fold {fold+1}: RMSPE = {score:.4f}  (best iter: {model.best_iteration_  if hasattr(model, 'best_iteration_') else model.best_iteration})")
+        # Save the LightGBM model for this fold
+        model.save_model(f"lgb_model_fold_{fold+1}.txt")
+        
+        best_iter = model.best_iteration_ if hasattr(model, 'best_iteration_') else model.best_iteration
+        print(f"  Fold {fold+1}: RMSPE = {score:.4f}  (best iter: {best_iter})")
 
     print(f"\nCV RMSPE: {np.mean(cv_scores):.4f} ± {np.std(cv_scores):.4f}")
 
@@ -145,7 +175,8 @@ def train(use_log_target=False):
     else:
         fi = pd.Series(models[-1].feature_importance("gain"), index=FEATURE_COLS)
     fi = fi.sort_values(ascending=False)
-    print(f"\nTop feature importances (gain):\n{fi.head(15).round(1)}")
+    print(f"\nTop 15 feature importances (gain):\n{fi.head(15).round(1)}")
+    np.save("oof_lgb.npy", oof_preds_lgb)
 
     return models, cv_scores
 
@@ -153,5 +184,5 @@ def train(use_log_target=False):
 if __name__ == "__main__":
     print("=== Raw target ===")
     models_raw, scores_raw = train(use_log_target=False)
-    print("\n=== Log target ===")
-    models_log, scores_log = train(use_log_target=True)
+    #print("\n=== Log target ===")
+    #models_log, scores_log = train(use_log_target=True)

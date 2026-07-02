@@ -8,7 +8,6 @@ Neutralization is Numerai-specific but useful for any cross-sectional strategy.
 import numpy as np
 import pandas as pd
 
-
 def zscore(series: pd.Series, window: int = None) -> pd.Series:
     """
     Z-score normalize a series. If window is provided, rolling z-score.

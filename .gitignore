@@ -19,6 +19,8 @@ env/
 *.ckpt
 mlruns/
 wandb/
+*.npy
+*.txt
 
 # OS
 .DS_Store
