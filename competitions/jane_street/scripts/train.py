@@ -12,11 +12,13 @@ Key decisions:
 - Drop first time_id per (date, symbol) — lag nulls
 """
 
+import gc
 import polars as pl
 import numpy as np
 import lightgbm as lgb
 import pandas as pd
 from pathlib import Path
+import polars.selectors as cs
 
 CACHE_DIR = Path(__file__).resolve().parents[1] / "feature_cache"
 PRIMARY_TARGET = "responder_6"
@@ -36,19 +38,18 @@ def weighted_r2(y_true: np.ndarray, y_pred: np.ndarray,
     return 1 - ss_res / (ss_tot + 1e-8)
 
 
-def load_cached_partitions(date_min: int = None,
-                           date_max: int = None) -> pl.DataFrame:
-    """Load and concatenate cached feature partitions."""
-    parts = []
-    for path in sorted(CACHE_DIR.glob("partition_*.parquet")):
-        df = pl.read_parquet(path)
-        if date_min is not None:
-            df = df.filter(pl.col("date_id") >= date_min)
-        if date_max is not None:
-            df = df.filter(pl.col("date_id") <= date_max)
-        if len(df) > 0:
-            parts.append(df)
-    return pl.concat(parts)
+# 1. Update your loading function to return a LazyFrame
+def load_cached_partitions(date_min: int = None, date_max: int = None) -> pl.LazyFrame:
+    """Scan cached feature partitions lazily."""
+    # scan_parquet can take a glob pattern directly, replacing the entire loop!
+    lf = pl.scan_parquet(CACHE_DIR / "partition_*.parquet")
+    
+    if date_min is not None:
+        lf = lf.filter(pl.col("date_id") >= date_min)
+    if date_max is not None:
+        lf = lf.filter(pl.col("date_id") <= date_max)
+        
+    return lf
 
 
 def get_feature_cols(df: pl.DataFrame) -> list:
@@ -65,37 +66,27 @@ def walk_forward_splits(dates: list, n_splits: int = 5):
         splits.append((train_dates, val_dates))
     return splits
 
-
 def train_lgbm():
-    print("Loading cached features...")
-    df = load_cached_partitions()
+    print("Scanning cached features lazily...")
+    lf = load_cached_partitions()
 
-    # Drop first time_id per (date, symbol) — lag nulls
-    df = df.filter(pl.col("time_id") > 0)
+    # Apply lazy transformations
+    lf = lf.filter(pl.col("time_id") > 0)
+    lf = lf.fill_null(0.0)
+    lf = lf.with_columns(cs.float().cast(pl.Float32))
 
-    # Fill any remaining nulls in lag/rolling cols with 0
-    df = df.fill_null(0.0)
-
-    print(f"Dataset: {df.shape}")
-    print(f"Date range: {df['date_id'].min()} to {df['date_id'].max()}")
-    print(f"Unique dates: {df['date_id'].n_unique()}")
-
-    feature_cols = get_feature_cols(df)
+    all_columns = lf.collect_schema().names()
+    feature_cols = [c for c in all_columns if c not in EXCLUDE_COLS]
     print(f"Features: {len(feature_cols)}")
 
-    # Convert to pandas for LightGBM
-    # Process in chunks to avoid OOM
-    print("Converting to pandas...")
-    pdf = df.select(feature_cols + ["date_id", PRIMARY_TARGET, "weight"]).to_pandas()
+    cols_to_keep = feature_cols + ["date_id", PRIMARY_TARGET, "weight"]
+    lf = lf.select(cols_to_keep)
 
-    X = pdf[feature_cols]
-    y = pdf[PRIMARY_TARGET]
-    w = pdf["weight"]
-    dates = pdf["date_id"]
-
-    all_dates = sorted(pdf["date_id"].unique())
+    # 1. Extract unique dates via a tiny, lightweight query
+    print("Extracting unique dates from disk...")
+    all_dates = sorted(lf.select("date_id").unique().collect().to_series().to_list())
     splits = walk_forward_splits(all_dates, n_splits=5)
-
+    
     params = {
         "objective": "regression",
         "metric": "rmse",
@@ -115,17 +106,43 @@ def train_lgbm():
     feature_importance = pd.Series(0.0, index=feature_cols)
 
     for fold, (train_dates, val_dates) in enumerate(splits):
-        train_mask = dates.isin(train_dates)
-        val_mask   = dates.isin(val_dates)
+        print(f"\n{'='*30}")
+        print(f"Preparing Fold {fold+1}...")
+        
+        # 2. Collect ONLY training data directly to NumPy (Skips Pandas!)
+        print("  Loading training data...")
+        train_polars = lf.filter(pl.col("date_id").is_in(list(train_dates))).collect()
+        
+        X_tr = train_polars.select(feature_cols).to_numpy()
+        y_tr = train_polars.select(PRIMARY_TARGET).to_numpy().ravel()
+        w_tr = train_polars.select("weight").to_numpy().ravel()
+        
+        # Destroy the Polars dataframe immediately
+        del train_polars
+        gc.collect()
 
-        X_tr, y_tr, w_tr = X[train_mask], y[train_mask], w[train_mask]
-        X_val, y_val, w_val = X[val_mask], y[val_mask], w[val_mask]
+        # 3. Collect ONLY validation data directly to NumPy
+        print("  Loading validation data...")
+        val_polars = lf.filter(pl.col("date_id").is_in(list(val_dates))).collect()
+        
+        X_val = val_polars.select(feature_cols).to_numpy()
+        y_val = val_polars.select(PRIMARY_TARGET).to_numpy().ravel()
+        w_val = val_polars.select("weight").to_numpy().ravel()
+        
+        del val_polars
+        gc.collect()
 
-        dtrain = lgb.Dataset(X_tr, label=y_tr, weight=w_tr)
-        dval   = lgb.Dataset(X_val, label=y_val, weight=w_val)
+        print(f"  Fold {fold+1} Shapes: train={len(X_tr):,} val={len(X_val):,}")
 
-        print(f"\nFold {fold+1}: train={len(X_tr):,} val={len(X_val):,}")
+        # 4. Create LightGBM Datasets
+        dtrain = lgb.Dataset(X_tr, label=y_tr, weight=w_tr, free_raw_data=True)
+        dval   = lgb.Dataset(X_val, label=y_val, weight=w_val, free_raw_data=True)
 
+        # Destroy NumPy arrays before training begins
+        del X_tr, y_tr, w_tr, X_val
+        gc.collect()
+
+        print("  Training model...")
         model = lgb.train(
             params, dtrain,
             num_boost_round=1000,
@@ -136,10 +153,18 @@ def train_lgbm():
             ]
         )
 
-        preds = model.predict(X_val)
-        preds = np.clip(preds, -5, 5)  # responders are clipped at ±5
+        # Validation data is still in dval (LightGBM handles internal validation)
+        # To run custom weighted_r2, we need the predictions. 
+        # dval.data might be cleared if free_raw_data=True, so we predict using the model directly.
+        # Wait, if free_raw_data=True, we can't predict on dval easily. 
+        # Let's re-read validation X for prediction to be incredibly safe on memory:
+        
+        print("  Evaluating...")
+        val_polars = lf.filter(pl.col("date_id").is_in(list(val_dates))).collect()
+        preds = model.predict(val_polars.select(feature_cols).to_numpy())
+        preds = np.clip(preds, -5, 5)
 
-        score = weighted_r2(y_val.values, preds, w_val.values)
+        score = weighted_r2(y_val, preds, w_val)
         cv_scores.append(score)
 
         feature_importance += pd.Series(
@@ -147,8 +172,11 @@ def train_lgbm():
             index=feature_cols
         )
 
-        print(f"Fold {fold+1} weighted R²: {score:.6f}  "
-              f"best_iter: {model.best_iteration}")
+        print(f"  Fold {fold+1} weighted R²: {score:.6f} (best_iter: {model.best_iteration})")
+        
+        # Final cleanup for the fold
+        del dtrain, dval, model, val_polars, preds, y_val, w_val
+        gc.collect()
 
     print(f"\n{'='*50}")
     print(f"CV Weighted R²: {np.mean(cv_scores):.6f} ± {np.std(cv_scores):.6f}")
