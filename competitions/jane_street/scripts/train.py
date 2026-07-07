@@ -56,14 +56,24 @@ def get_feature_cols(df: pl.DataFrame) -> list:
     return [c for c in df.columns if c not in EXCLUDE_COLS]
 
 
-def walk_forward_splits(dates: list, n_splits: int = 5):
-    """Expanding window walk-forward splits on date_id."""
+def walk_forward_splits(dates: list, n_splits: int = 5, max_train_folds: int = 2):
+    """
+    Rolling window walk-forward splits on date_id.
+    max_train_folds limits the lookback window to prevent OOM.
+    """
     fold_size = len(dates) // (n_splits + 1)
     splits = []
+    
     for i in range(1, n_splits + 1):
-        train_dates = set(dates[:i * fold_size])
-        val_dates   = set(dates[i * fold_size:(i + 1) * fold_size])
+        # Instead of starting at 0, we start at a calculated index
+        # to only keep the most recent 'max_train_folds' worth of data
+        start_idx = max(0, (i - max_train_folds) * fold_size)
+        
+        train_dates = set(dates[start_idx : i * fold_size])
+        val_dates   = set(dates[i * fold_size : (i + 1) * fold_size])
+        
         splits.append((train_dates, val_dates))
+        
     return splits
 
 def train_lgbm():
@@ -85,7 +95,7 @@ def train_lgbm():
     # 1. Extract unique dates via a tiny, lightweight query
     print("Extracting unique dates from disk...")
     all_dates = sorted(lf.select("date_id").unique().collect().to_series().to_list())
-    splits = walk_forward_splits(all_dates, n_splits=5)
+    splits = walk_forward_splits(all_dates, n_splits=5, max_train_folds=2)
     
     params = {
         "objective": "regression",
@@ -138,8 +148,9 @@ def train_lgbm():
         dtrain = lgb.Dataset(X_tr, label=y_tr, weight=w_tr, free_raw_data=True)
         dval   = lgb.Dataset(X_val, label=y_val, weight=w_val, free_raw_data=True)
 
-        # Destroy NumPy arrays before training begins
-        del X_tr, y_tr, w_tr, X_val
+        # Destroy ONLY the training arrays before training begins. 
+        # Keep X_val alive for predictions!
+        del X_tr, y_tr, w_tr
         gc.collect()
 
         print("  Training model...")
@@ -153,15 +164,9 @@ def train_lgbm():
             ]
         )
 
-        # Validation data is still in dval (LightGBM handles internal validation)
-        # To run custom weighted_r2, we need the predictions. 
-        # dval.data might be cleared if free_raw_data=True, so we predict using the model directly.
-        # Wait, if free_raw_data=True, we can't predict on dval easily. 
-        # Let's re-read validation X for prediction to be incredibly safe on memory:
-        
         print("  Evaluating...")
-        val_polars = lf.filter(pl.col("date_id").is_in(list(val_dates))).collect()
-        preds = model.predict(val_polars.select(feature_cols).to_numpy())
+        # Predict directly on the X_val array we kept in memory!
+        preds = model.predict(X_val)
         preds = np.clip(preds, -5, 5)
 
         score = weighted_r2(y_val, preds, w_val)
@@ -175,7 +180,7 @@ def train_lgbm():
         print(f"  Fold {fold+1} weighted R²: {score:.6f} (best_iter: {model.best_iteration})")
         
         # Final cleanup for the fold
-        del dtrain, dval, model, val_polars, preds, y_val, w_val
+        del dtrain, dval, model, X_val, preds, y_val, w_val
         gc.collect()
 
     print(f"\n{'='*50}")
