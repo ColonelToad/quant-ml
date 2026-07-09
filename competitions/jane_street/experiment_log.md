@@ -14,7 +14,7 @@
 | 1 | LightGBM baseline | 0.8789 | — | Walk-forward CV, sample_weight | `responder_6_lag_1` dominates at 440M gain. Weighted R² of 0.88 is real — confirmed by naive lag baseline at 0.794 |
 | 2 | GRU | 0.8866 | 229,700 | Static → hidden init, multi-task head r6/r3/r7/r8 | +0.008 over LGBM. Sequential modeling adds genuine signal. Partition 1 consistently harder (earlier regime) |
 | 3 | Multitask AutoEncoder | 0.8019 | 99,505 | Bottleneck 64d, reconstruction loss as regularizer | Trails GRU by 0.085 — row-wise misses sequential structure. Real value is as feature extractor into LGBM |
-| 4 | TFT | TBD | TBD | VSN, windowed attention (32 steps), static context gates | TBD |
+| 4 | TFT | 0.8534 | 850,248 | VSN, windowed attention (32 steps), static context gates | Getting it to work well vs just getting it to work on something was quite a challenge |
 | 5 | Cross-Symbol Transformer | TBD | TBD | Attention across symbols at each time step | TBD |
 | 6 | KAN | TBD | TBD | Learnable spline activations | TBD |
 
