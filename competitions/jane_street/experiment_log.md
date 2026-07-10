@@ -15,7 +15,7 @@
 | 2 | GRU | 0.8866 | 229,700 | Static → hidden init, multi-task head r6/r3/r7/r8 | +0.008 over LGBM. Sequential modeling adds genuine signal. Partition 1 consistently harder (earlier regime) |
 | 3 | Multitask AutoEncoder | 0.8019 | 99,505 | Bottleneck 64d, reconstruction loss as regularizer | Trails GRU by 0.085 — row-wise misses sequential structure. Real value is as feature extractor into LGBM |
 | 4 | TFT | 0.8534 | 850,248 | VSN, windowed attention (32 steps), static context gates | Getting it to work well vs just getting it to work on something was quite a challenge |
-| 5 | Cross-Symbol Transformer | TBD | TBD | Attention across symbols at each time step | TBD |
+| 5 | Cross-Symbol Transformer | 0.8396 | 26,500 | Attention across symbols at each time step | Very intersting to see CST in action, slowest model to train (i/o bound, could have optimized) and focused on answering `does knowing what symbol_3 is doing right now help predict symbol_7's next step` |
 | 6 | KAN | TBD | TBD | Learnable spline activations | TBD |
 
 ---
