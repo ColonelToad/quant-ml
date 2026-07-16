@@ -21,6 +21,8 @@ from pathlib import Path
 import polars.selectors as cs
 
 CACHE_DIR = Path(__file__).resolve().parents[1] / "feature_cache"
+MODEL_DIR = Path(__file__).resolve().parents[1] / "models"
+MODEL_DIR.mkdir(exist_ok=True, parents=True)
 PRIMARY_TARGET = "responder_6"
 AUX_TARGETS = ["responder_3", "responder_7", "responder_8"]
 ALL_RESPONDERS = [f"responder_{i}" for i in range(9)]
@@ -114,6 +116,8 @@ def train_lgbm():
 
     cv_scores = []
     feature_importance = pd.Series(0.0, index=feature_cols)
+    best_val_r2 = -np.inf
+    best_model_path = MODEL_DIR / "lgbm_baseline_best.txt"
 
     for fold, (train_dates, val_dates) in enumerate(splits):
         print(f"\n{'='*30}")
@@ -178,6 +182,13 @@ def train_lgbm():
         )
 
         print(f"  Fold {fold+1} weighted R²: {score:.6f} (best_iter: {model.best_iteration})")
+        
+        # ADD THIS BLOCK: Check if this is the best fold and save it
+        if score > best_val_r2:
+            best_val_r2 = score
+            # LightGBM has a native, highly efficient save format (.txt)
+            model.save_model(str(best_model_path))
+            print(f"  *** Saved new best model (val_r2={score:.6f}) to {best_model_path}")
         
         # Final cleanup for the fold
         del dtrain, dval, model, X_val, preds, y_val, w_val

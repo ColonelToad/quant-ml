@@ -11,12 +11,13 @@
 
 | # | Model | Val R² | Params | Key Design Choice | What I Learned |
 |---|-------|--------|--------|-------------------|----------------|
-| 1 | LightGBM baseline | 0.8789 | — | Walk-forward CV, sample_weight | `responder_6_lag_1` dominates at 440M gain. Weighted R² of 0.88 is real — confirmed by naive lag baseline at 0.794 |
-| 2 | GRU | 0.8866 | 229,700 | Static → hidden init, multi-task head r6/r3/r7/r8 | +0.008 over LGBM. Sequential modeling adds genuine signal. Partition 1 consistently harder (earlier regime) |
+| 1 | LightGBM baseline | -0.4480 | — | Walk-forward CV, sample_weight | Heavily overfit to historical regimes. Catastrophically failed on hidden validation partition shifts (-0.4480), highlighting why non-linear sequential modeling is vital for stationary domain changes. |
+| 2 | GRU (Stateless vs Stateful) | 0.8521 | 229,700 | Static → hidden init, multi-task head r6/r3/r7/r8 | Dropped to **0.8487** under stateless step-by-step evaluation due to step-wise "amnesia". Reclaiming statefulness via per-symbol hidden state propagation pushed tracking to **0.8521**. |
 | 3 | Multitask AutoEncoder | 0.8019 | 99,505 | Bottleneck 64d, reconstruction loss as regularizer | Trails GRU by 0.085 — row-wise misses sequential structure. Real value is as feature extractor into LGBM |
-| 4 | TFT | 0.8534 | 850,248 | VSN, windowed attention (32 steps), static context gates | Getting it to work well vs just getting it to work on something was quite a challenge |
-| 5 | Cross-Symbol Transformer | 0.8396 | 26,500 | Attention across symbols at each time step | Very intersting to see CST in action, slowest model to train (i/o bound, could have optimized) and focused on answering `does knowing what symbol_3 is doing right now help predict symbol_7's next step` |
+| 4 | TFT | 0.8534 | 850,248 | VSN, windowed attention (32 steps), static context gates | High performance offline, but incredibly computationally heavy and complex to maintain in real-time constraint environments. |
+| 5 | Cross-Symbol Transformer | 0.8396 | 26,500 | Attention across symbols at each time step | Massive success. Became the structural anchor of the ensemble. By shifting the attention window from time to spatial (cross-symbol), it effectively bypassed the statefulness tracking requirement. |
 | 6 | KAN | TBD | TBD | Learnable spline activations | TBD |
+| **7** | **Final Blended Ensemble** | **0.8651** | — | SLSQP optimized blend (3x CST seeds + Stateful GRU) | The ultimate winner. Blending spatial (CST) and temporal (GRU) inductive biases out-performed any standalone framework, yielding a robust **0.8651** R² score. |
 
 ---
 
@@ -43,34 +44,36 @@
 
 ---
 
-## Architecture Decisions
+## Architecture & Production Decisions
 
 | Decision | Choice | Reasoning |
 |----------|--------|-----------|
 | TFT attention window | 32 steps | Autocorr gone by lag-20 |
 | Multi-task targets | r6 + r3/r7/r8 | Corr > 0.43; r0/r1/r2 would hurt |
-| AE role | Feature extractor only | Bottleneck → LGBM, not standalone |
-| Online learning | Freeze base, fine-tune output head | Fewer params, base preserved |
-| Training cutoff | date_id ≥ 247 | Full feature availability |
+| Streaming Engine | NumPy Vectorization | Polars/Pandas `.filter()` reallocates memory on every single time slice, causing catastrophic CPU OOM crashes across a 327k stream. |
+| Tensor Management | Explicit Detach + Clone | PyTorch slice views secretly preserve full-batch computational graphs. Explicit `.detach().clone()` on hidden states isolates VRAM footprint. |
+| State Robustness | Per-Symbol Zero-Padding | Missing symbols in streaming batches break tensor stacking (`torch.stack`). Masking and backing with static zeros guarantees loop stability. |
 | Sequence length | 849 steps | 95% of sequences this length |
 
 ---
 
 ## Ensemble Plan
 
-1. LightGBM — tabular feature interactions
-2. GRU — temporal autocorrelation
-3. Residual MLP — nonlinear feature combinations
-4. AE embeddings → LightGBM — denoised feature representation
+1. **Cross-Symbol Transformer Sub-Ensemble (3 Seeds):** Spatial features capturing cross-asset momentum.
+2. **Jane Street GRU:** Temporal features capturing intraday momentum.
+3. **Weights:** Optimized using SciPy SLSQP bounds (CST heavily favored at ~88% overall mass, GRU providing stabilizing ~12% context).
 
-Online learning: GRU + TFT fine-tune output head per batch. LGBM static.
+Online learning: GRU fine-tunes output head dynamically using revealed lag payloads.
 
 ---
 
-## Open Questions
+## Open Questions — Answered
 
-- Does TFT's VSN outperform GRU's implicit feature weighting?
-- Does cross-symbol attention capture market-wide patterns per-symbol models miss?
-- Does AE bottleneck as LGBM input improve over raw features?
-- Does KAN find patterns MLP with fixed activations misses?
-- What is the optimal ensemble weighting?
+- **Does TFT's VSN outperform GRU's implicit feature weighting?** 
+  * TFT performed admirably but fell short of the stateful GRU + CST ensemble, while presenting an unviable computational footprint for live real-time latency thresholds.
+- **Does cross-symbol attention capture market-wide patterns per-symbol models miss?** 
+  * Yes. The Cross-Symbol Transformer (CST) single-handedly saved the ensemble from the LightGBM baseline collapse, carrying an 88% weight attribution in the optimized blend.
+- **How do you keep memory bounded during live PyTorch streams?** 
+  * By migrating data frames out of the loop into contiguous C-NumPy blocks, computing index boundaries analytically, and clearing graph history using detached tensor clones.
+- **What is the optimal ensemble weighting?** 
+  * A stark division of labor: 29.15% (CST Seed 42), 29.56% (CST Seed 100), 29.34% (CST Seed 999), and 11.94% (Stateful GRU).
